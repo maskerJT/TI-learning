@@ -15,4 +15,9 @@ using namespace std
         using和namespace都是C++的关键字，std是标准程序库所驻之命名空间（namespace)的名称。
         往后就不再使用using namespace std;
         而是使用std::cin>>varible;或者using std::cin;使用using 声明，而不是using编译命令。
-      
+/\      文件路径的正反斜杠，只有windows系统中用\，其他的项目中，linux中都使用/，在做项目的时候TI的板子给的文件路径都是斜杠/
+        在VS当中包含头文件的绝对路径时，使用的是Windows的资源管理器的复制出来的路径，这个时候用的是反斜杠\，windows之所以要这样是因为
+        Windows中使用斜杆/ 作为DOS命令提示符的参数标志，为了避免混淆。
+        ./Images/这样写表示，当前目录中的Images文件夹
+        …/Images/这样写表示，当前目录的上一层目录中的Images文件夹
+        /Images/这样写表示，项目根目录
