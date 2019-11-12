@@ -21,3 +21,4 @@ using namespace std
         ./Images/这样写表示，当前目录中的Images文件夹
         …/Images/这样写表示，当前目录的上一层目录中的Images文件夹
         /Images/这样写表示，项目根目录
+typedef void (*F) (int)定义了一个指向函数的指针F，其返回值 void 类型，参数是后面的(int).
