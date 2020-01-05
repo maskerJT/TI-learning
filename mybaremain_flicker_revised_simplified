@@ -1,0 +1,1388 @@
+//this is the edition whose GT_trace was deleted.
+#include "app.h"
+#include "mybaremain.h"
+#include <ti/csl/hw_types.h>
+#include <ti/csl/tistdtypes.h>
+#include <ti/drv/pm/include/prcm/pmhal_videopll.h>
+#include <ti/drv/pm/include/prcm/pmlib_videopll.h>
+#include <ti/drv/pm/include/prcm/V1/pmhal_prcm.h>
+
+static void DispApp_init(DispApp_Obj *appObj);
+static void DispApp_deInit(DispApp_Obj *appObj);
+static void DispApp_run(DispApp_Obj      *appObj,const DispApp_TestParams *testPrms);
+static void DispApp_create(DispApp_Obj *appObj);
+static Int32 DispApp_configDctrl(DispApp_Obj *appObj);
+static Int32 DispApp_configDctrlPipe(DispApp_Obj *appObj);
+static Int32 DispApp_allocAndQueueFrames(const DispApp_Obj *appObj,DispApp_InstObj   *instObj);
+static void DispApp_initParams(DispApp_Obj *appObj);
+static void DispApp_printStatistics(DispApp_Obj *appObj,UInt32        execTimeInMsecs);
+static void DispApp_turnoffLCD(DispApp_Obj *appObj);
+static Int32 DispApp_LoadBuf(DispApp_Obj *appObj,const DispApp_LoadBufCfg *cfg);
+static Int32 DispApp_FreeBuf(DispApp_Obj     *appObj,const DispApp_LoadBufCfg *cfg);
+static DispApp_BufInfo *DispApp_GetBufInfo(const DispApp_Obj *appObj, UInt32 dataFmt,UInt32 scanFmt,UInt32 fieldsMerged,UInt32 pitch);
+static void DispApp_delete(DispApp_Obj *appObj);
+Int32 myappDefaultInit(UInt32 isI2cInitReq);
+int mypclkcfg(UInt32 pixclk);
+Int32 myappDefaultInit(UInt32 isI2cInitReq);
+void mylcdon(void);
+void setpolarity(void);
+void changecolor(void);
+
+
+static DispApp_Obj     gDispAppObj;
+static DispApp_BufInfo Yuyv422FieldsMerged = {NULL, 0u};
+static DispApp_BufInfo Yuyv422InterlacedFieldsSep = {NULL, 0u};
+static DispApp_BufInfo BGR24888FieldsMerged = {NULL, 0u};
+static DispApp_BufInfo BGR16565FieldsMerged = {NULL, 0u};
+
+/* ========================================================================== */
+/*                          Function Definitions                              */
+/* ========================================================================== */
+static  Board_STATUS DispApp_boardInit(void)
+{
+    Board_STATUS ret;
+    Board_initCfg boardCfg;
+    boardCfg = BOARD_INIT_PINMUX_CONFIG | BOARD_INIT_MODULE_CLOCK;
+    boardCfg |= BOARD_INIT_UART_STDIO;
+    ret = Board_init(boardCfg);
+    return (ret);
+}
+
+int main(void)  //including:boardinit/uartinit/rundss
+{
+    UInt32                  tempFuncPtr;
+    BspOsal_InitParams_t    bspOsalInitPrms = {0};
+    DispApp_boardInit();
+    BspUtils_uartInit();
+    tempFuncPtr = (UInt32) & BspUtils_uartPrint;
+    bspOsalInitPrms.printFxn = (BspOsal_PrintFxn) (tempFuncPtr);
+    BspOsal_Init(&bspOsalInitPrms);
+
+    appPrint("@@@@@@@@@@@@@@@@@RUNNING MYBAREMAIN@@@@@@@@@@@@@@@@@@\n");
+    DispApp_Obj    *appObj = (DispApp_Obj *) &gDispAppObj;
+    const DispApp_TestParams *testPrms= &gDispAppTestPrms[0];
+    DispApp_init(appObj);	
+    appObj->enableAutoRun =(UInt32) FALSE;
+	while(1)
+	{
+    	BspUtils_appServiceWatchdog();
+   		DispApp_run(appObj, testPrms);	
+	}
+	DispApp_deInit(appObj);
+    appPrint("@@@@@@@@@@@@@@@@@FINISH MYBAREMAIN@@@@@@@@@@@@@@@@@@@\n");
+    return (0);
+}
+
+
+static void DispApp_init(DispApp_Obj *appObj)//myappdefault,create VPS_DCTRL_DRV,set primary clk, load buffer
+{
+    Int32  retVal = FVID2_SOK;
+    UInt32 isI2cInitReq=TRUE;
+    UInt32 defPixelClk=20000U;
+	myappDefaultInit(isI2cInitReq);
+    appObj->dctrlHandle = Fvid2_create(FVID2_VPS_DCTRL_DRV,VPS_DCTRL_INST_0,NULL,NULL,NULL);                     	
+    mypclkcfg(defPixelClk);
+	DispApp_LoadBuf(appObj, &gDispDssLoadBufCfg[0]);
+    return;
+}
+
+static void DispApp_deInit(DispApp_Obj *appObj)
+{
+    Int32  retVal = FVID2_SOK;
+    UInt32 isI2cDeInitReq;
+    UInt32 bufCfgId;
+
+    /* Delete DCTRL handle */
+    retVal = Fvid2_delete(appObj->dctrlHandle, NULL);
+    if (retVal != FVID2_SOK)
+    {
+        GT_0trace(BspAppTrace, GT_ERR,
+                  APP_NAME ": DCTRL handle delete failed!!!\r\n");
+    }
+    if (FVID2_SOK == retVal)
+    {
+        /* Free all the Buffers */
+        for (bufCfgId = 0;
+             bufCfgId <
+             (sizeof (gDispDssLoadBufCfg) / sizeof (DispApp_LoadBufCfg));
+             bufCfgId++)
+        {
+            retVal = DispApp_FreeBuf(appObj, &gDispDssLoadBufCfg[bufCfgId]);
+            if (FVID2_SOK != retVal)
+            {
+                GT_0trace(BspAppTrace, GT_ERR,
+                          "Load buffer failed!!\r\n");
+            }
+        }
+    }
+
+    if (FVID2_SOK == retVal)
+    {
+        /* System de-init */
+        isI2cDeInitReq = TRUE;
+        retVal         = BspUtils_appDefaultDeInit(isI2cDeInitReq);
+        if (retVal != FVID2_SOK)
+        {
+            GT_0trace(BspAppTrace, GT_ERR,
+                      APP_NAME ": System De-Init Failed!!!\r\n");
+        }
+    }
+
+    if (FVID2_SOK == retVal)
+    {
+        /* Needed onlt for TDA2xx platform. Other platform will do nothing
+         * and return OK */
+        retVal = Bsp_platformEnableHdmiPll(FALSE);
+        if (retVal != FVID2_SOK)
+        {
+            GT_0trace(BspAppTrace, GT_ERR,
+                      APP_NAME ": Disabling HDMI PLL Failed!!!\r\n");
+        }
+    }
+
+    if (FVID2_SOK == retVal)
+    {
+        GT_0trace(BspAppTrace, GT_INFO,
+                  APP_NAME ": DispApp_deInit() - DONE !!!\r\n");
+    }
+
+    return;
+}
+/**
+ *  DispApp_runTest
+ *  Display test function.
+ */
+static void DispApp_run(DispApp_Obj    *appObj,const DispApp_TestParams *testPrms)//process driver.
+{
+    Int32            retVal = FVID2_SOK;
+    UInt32           instCnt=0U;
+    UInt32           displayTime;
+    UInt32           loopCount=0;
+    DispApp_InstObj *instObj = NULL;
+	appObj->startTime = BspOsal_getCurTimeInMsec();	
+	
+    BspUtils_memcpy(&appObj->testPrms, testPrms, sizeof (appObj->testPrms));
+	GT_0trace(BspAppTrace, GT_INFO,APP_NAME ": starting display ...  !!!\r\n");
+    DispApp_create(appObj);
+    instObj = &appObj->instObj[instCnt];
+    Fvid2_start(instObj->drvHandle, NULL);
+
+    while (loopCount < appObj->testPrms.runCount)
+    {
+		changecolor();
+        BspOsal_sleep(1000);
+        appObj->cpuLoadCount++;
+		loopCount++;
+    }
+
+    Fvid2_stop(instObj->drvHandle, NULL);
+    
+    displayTime = (BspOsal_getCurTimeInMsec() - appObj->startTime);
+    GT_0trace(BspAppTrace, GT_INFO,APP_NAME ": Stopping display ... DONE !!!\r\n");
+    DispApp_printStatistics(appObj, displayTime);
+    DispApp_delete(appObj);
+	
+    return;
+}
+
+
+static void DispApp_create(DispApp_Obj *appObj)
+{
+    Int32  retVal = FVID2_SOK;
+    UInt32 instCnt=0;
+    DispApp_InstObj      *instObj;
+    Bsp_LcdCtrlPanelInfo *lcdPanelInfo;
+	
+    DispApp_initParams(appObj);
+	mylcdon();
+			
+    lcdPanelInfo = &appObj->lcdPanelInfo;
+    Fvid2ModeInfo_init(&lcdPanelInfo->modeInfo);
+    lcdPanelInfo->modeInfo.standard    = FVID2_STD_CUSTOM;
+    lcdPanelInfo->modeInfo.width       = 480U;
+    lcdPanelInfo->modeInfo.height      = 272U;
+    lcdPanelInfo->modeInfo.scanFormat  = FVID2_SF_PROGRESSIVE;
+    lcdPanelInfo->modeInfo.pixelClock  = 10800U;
+    lcdPanelInfo->modeInfo.fps         = 60U;
+    lcdPanelInfo->modeInfo.hBackPorch  = 45U;
+    lcdPanelInfo->modeInfo.hSyncLen    = 30U;
+    lcdPanelInfo->modeInfo.hFrontPorch = 45U;
+    lcdPanelInfo->modeInfo.vBackPorch  = 12U;
+    lcdPanelInfo->modeInfo.vSyncLen    = 4U;
+    lcdPanelInfo->modeInfo.vFrontPorch = 12U;
+
+    lcdPanelInfo->videoIfWidth    = FVID2_VIFW_24BIT;
+    lcdPanelInfo->videoDataFormat = FVID2_DF_RGB24_888;
+    lcdPanelInfo->videoIfMode     = FVID2_VIFM_SCH_DS_HSYNC_VSYNC;
+
+    lcdPanelInfo->vsPolarity       = FVID2_POL_HIGH;
+    lcdPanelInfo->hsPolarity       = FVID2_POL_HIGH;
+    lcdPanelInfo->actVidPolarity   = FVID2_POL_HIGH;
+    lcdPanelInfo->fidPolarity      = FVID2_POL_HIGH;
+    lcdPanelInfo->pixelClkPolarity = FVID2_POL_HIGH;
+
+    DispApp_configDctrl(appObj);
+
+
+    instObj = &appObj->instObj[instCnt];
+    instObj->drvHandle = Fvid2_create(FVID2_VPS_DISP_DRV,instObj->instId,&instObj->createPrms,&instObj->createStatus,&instObj->cbPrms);
+
+	BspUtils_appPrintDispCreateStatus(&instObj->createStatus);
+    Fvid2_control(instObj->drvHandle,IOCTL_VPS_DISP_SET_DSS_PARAMS,&instObj->dssPrms,NULL);
+	DispApp_allocAndQueueFrames(appObj, instObj);
+    GT_0trace(BspAppTrace, GT_INFO,APP_NAME ": Display create complete!!\r\n");
+    return;
+}
+
+
+
+static void DispApp_delete(DispApp_Obj *appObj)
+{
+    Int32            retVal;
+    UInt32           instCnt, encInst, sdVencEnable;
+    DispApp_InstObj *instObj;
+    Fvid2_FrameList  frmList;
+    Vps_DctrlConfig *dctrlCfg;
+
+    dctrlCfg = &appObj->dctrlCfg;
+
+    retVal = Fvid2_control(
+        appObj->dctrlHandle,
+        IOCTL_VPS_DCTRL_CLEAR_CONFIG,
+        dctrlCfg,
+        NULL);
+
+    /* Turn Off the Video Encoders/LCD controllers if required */
+    for (encInst = 0; encInst < appObj->testPrms.numEnc; encInst++)
+    {
+        if (appObj->testPrms.encDrvId[encInst] == FVID2_LCD_CTRL_DRV)
+        {
+            /* Turn off LCD controller only if platform is EVM */
+            if (BSP_PLATFORM_ID_EVM == Bsp_platformGetId())
+            {
+                DispApp_turnoffLCD(appObj);
+            }
+        }
+        else if ((appObj->testPrms.encDrvId[encInst] ==
+                  FVID2_VID_ENC_SII9022A_DRV) ||
+                 (appObj->testPrms.encDrvId[encInst] ==
+                  FVID2_VID_ENC_DS90UH925_DRV))
+        {
+            /* DeConfigure Video Encoder only if platform is EVM */
+            if (0)
+            {
+               
+                    GT_0trace(
+                        BspAppTrace, GT_ERR,
+                        APP_NAME
+                        ": Error: DeConfiguring Encoder failed!!\r\n");
+    
+            }
+        }
+        else if (appObj->testPrms.isSdVenc == TRUE)
+        {
+            sdVencEnable = FALSE;
+            /* SD-VENC Power off */
+            retVal = Fvid2_control(
+                appObj->dctrlHandle,
+                IOCTL_VPS_DCTRL_ENABLE_SDVENC,
+                &sdVencEnable,
+                NULL);
+            if (retVal != FVID2_SOK)
+            {
+                GT_0trace(BspAppTrace, GT_ERR,
+                          APP_NAME ": Disabling SD-VENC IOCTL Failed!!!\r\n");
+            }
+        }
+        else
+        {
+            /* Do nothing */
+        }
+    }
+
+    for (instCnt = 0U; instCnt < appObj->testPrms.numHandles; instCnt++)
+    {
+        instObj = &appObj->instObj[instCnt];
+
+        /* Dequeue all the request from the driver */
+        while (1U)
+        {
+            retVal = Fvid2_dequeue(
+                instObj->drvHandle,
+                &frmList,
+                0U,
+                FVID2_TIMEOUT_NONE);
+            if (FVID2_SOK != retVal)
+            {
+                break;
+            }
+        }
+
+        retVal = Fvid2_delete(instObj->drvHandle, NULL);
+        if (FVID2_SOK != retVal)
+        {
+            GT_0trace(BspAppTrace, GT_ERR,
+                      APP_NAME ": Display Delete Failed!!!\r\n");
+            break;
+        }
+    }
+    if (FVID2_SOK == retVal)
+    {
+        GT_0trace(BspAppTrace, GT_INFO,
+                  APP_NAME ": Display delete complete!!\r\n");
+    }
+}
+
+static Int32 DispApp_configDctrl(DispApp_Obj *appObj)
+{
+    Int32  retVal = FVID2_SOK;
+    Vps_DctrlConfig             *dctrlCfg;
+    Vps_DssDispcOvlyPanelConfig *panelCfg;
+    Fvid2_ModeInfo              *mInfo;
+    Vps_DctrlVencDivisorInfo vencDivisors;
+    Vps_DctrlOutputInfo vencOutput;
+    UInt32 pixelClk, instCnt, sdVencEnable;
+    DispApp_InstObj *instObj;
+    Vps_DssDispcAdvLcdTdmConfig  advTdmPrms;
+    Vps_DctrlSDVencVideoStandard vidStd;
+
+    dctrlCfg = &appObj->dctrlCfg;
+    VpsDctrlConfig_init(dctrlCfg);
+    dctrlCfg->useCase  = VPS_DCTRL_USERSETTINGS;
+    dctrlCfg->numEdges = 0U;
+
+    if (appObj->testPrms.vencId[0] == VPS_DCTRL_DSS_VENC_LCD1)
+    {
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].startNode =
+            VPS_DCTRL_DSS_VID1_INPUT_PATH;
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].endNode =
+            VPS_DCTRL_DSS_LCD1_BLENDER;
+        dctrlCfg->numEdges++;
+
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].startNode =
+            VPS_DCTRL_DSS_VID2_INPUT_PATH;
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].endNode =
+            VPS_DCTRL_DSS_LCD1_BLENDER;
+        dctrlCfg->numEdges++;
+
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].startNode =
+            VPS_DCTRL_DSS_VID3_INPUT_PATH;
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].endNode =
+            VPS_DCTRL_DSS_LCD1_BLENDER;
+        dctrlCfg->numEdges++;
+
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].startNode =
+            VPS_DCTRL_DSS_GFX1_INPUT_PATH;
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].endNode =
+            VPS_DCTRL_DSS_LCD1_BLENDER;
+        dctrlCfg->numEdges++;
+
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].startNode =
+            VPS_DCTRL_DSS_LCD1_BLENDER;
+        dctrlCfg->edgeInfo[dctrlCfg->numEdges].endNode =
+            VPS_DCTRL_DSS_DPI1_OUTPUT;
+        dctrlCfg->numEdges++;
+
+        dctrlCfg->vencInfo.modeInfo[0U].vencId = VPS_DCTRL_DSS_VENC_LCD1;
+        Fvid2ModeInfo_init(&dctrlCfg->vencInfo.modeInfo[1U].mInfo);
+        dctrlCfg->vencInfo.modeInfo[0U].mInfo.standard = appObj->testPrms.standard[0U];
+    }
+
+    dctrlCfg->vencInfo.numVencs = 1U;
+
+    mInfo = &dctrlCfg->vencInfo.modeInfo[0U].mInfo;
+    BspUtils_memcpy(mInfo, &appObj->lcdPanelInfo.modeInfo, sizeof (Fvid2_ModeInfo));
+  
+    dctrlCfg->vencInfo.tiedVencs = 0U;
+
+    panelCfg = &appObj->panelCfg;
+
+    panelCfg->alphaBlenderEnable = 0;
+    panelCfg->backGroundColor    = 0x00;
+    panelCfg->colorKeyEnable     = 1;
+    /* Source transparency color key selected */
+    panelCfg->colorKeySel        = VPS_DSS_DISPC_TRANS_COLOR_KEY_SRC;
+    panelCfg->deltaLinesPerPanel = 0;
+    panelCfg->transColorKey      = 0x00;
+
+    vencDivisors.vencId     = appObj->testPrms.vencId[0];
+    vencDivisors.divisorLCD = 1;
+    vencDivisors.divisorPCD = 1;
+
+    vencOutput.actVidPolarity   = VPS_DCTRL_POLARITY_ACT_HIGH;
+    vencOutput.pixelClkPolarity = VPS_DCTRL_POLARITY_ACT_HIGH;
+    vencOutput.dvoFormat        = VPS_DCTRL_DVOFMT_GENERIC_DISCSYNC;
+    vencOutput.hsPolarity       = VPS_DCTRL_POLARITY_ACT_HIGH;
+    vencOutput.vsPolarity       = VPS_DCTRL_POLARITY_ACT_HIGH;
+    vencOutput.dataFormat       = FVID2_DF_RGB24_888;
+    vencOutput.videoIfWidth     = FVID2_VIFW_24BIT;
+
+    if (1)
+    {
+        panelCfg->vencId  = appObj->testPrms.vencId[0];
+        vencOutput.vencId = appObj->testPrms.vencId[0];
+        /* Setting hync and vsync pol to be negative as LCD panel expects it to be */
+        if (appObj->testPrms.encDrvId[0] == FVID2_LCD_CTRL_DRV)
+        {
+            if (FVID2_POL_LOW == appObj->lcdPanelInfo.pixelClkPolarity)
+            {
+                Bsp_platformSetLcdClkPolarity(BSP_PLATFORM_VENC_LCD1, FVID2_POL_LOW);
+            }
+            vencOutput.hsPolarity   = appObj->lcdPanelInfo.hsPolarity;
+            vencOutput.vsPolarity   = appObj->lcdPanelInfo.vsPolarity;
+            vencOutput.dataFormat   = appObj->lcdPanelInfo.videoDataFormat;
+            vencOutput.videoIfWidth = appObj->lcdPanelInfo.videoIfWidth;
+
+            /* Set display width/height equal to that of LCD width/height */
+            instObj = &appObj->instObj[instCnt];
+
+            if (DISP_APP_USE_LCD_WIDTH == appObj->testPrms.inWidth[instCnt])
+            {
+                if (appObj->lcdPanelInfo.modeInfo.width <=DISP_APP_BUF_WIDTH)
+                {
+                    appObj->testPrms.inWidth[instCnt] =appObj->lcdPanelInfo.modeInfo.width;
+                    instObj->inWidth = appObj->lcdPanelInfo.modeInfo.width;
+                    instObj->dssPrms.inFmt.width = instObj->inWidth;
+                    instObj->dssPrms.tarWidth    = instObj->inWidth;
+                }
+            }
+            if (DISP_APP_USE_LCD_HEIGHT ==appObj->testPrms.inHeight[instCnt])
+            {
+                if (appObj->lcdPanelInfo.modeInfo.height <=DISP_APP_BUF_HEIGHT)
+                {
+                    appObj->testPrms.inHeight[instCnt] =appObj->lcdPanelInfo.modeInfo.height;
+                    instObj->inHeight =appObj->lcdPanelInfo.modeInfo.height;
+                    instObj->dssPrms.inFmt.height = instObj->inHeight;
+                    instObj->dssPrms.tarHeight    = instObj->inHeight;
+                }
+            }
+        }
+    }
+
+
+    /* This IOCTL should be called before SET_CONFIG_IOCTL */
+    retVal+=Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_SET_VENC_OUTPUT,&vencOutput,NULL);
+	appPrint("@@@@@@@@@@@@@@@@Now setting the polarity\n");
+	setpolarity();
+
+    if (appObj->testPrms.vencId[0] != VPS_DCTRL_DSS_VENC_HDMI)
+    {
+        /* TDM param configuration is not applicable for HDMI Overlay. */
+        VpsDssDispcAdvLcdTdmConfig_init(&advTdmPrms);
+        /* Disable TDM mode .*/
+        advTdmPrms.tdmEnable = 0;
+        advTdmPrms.vencId    = appObj->testPrms.vencId[0];
+        retVal += Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_DSS_SET_ADV_VENC_TDM_PARAMS,&advTdmPrms,NULL);
+    }
+
+
+    retVal += Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_SET_CONFIG,dctrlCfg,NULL);
+    retVal += Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_SET_OVLY_PARAMS,panelCfg,NULL);
+    retVal += Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_SET_VENC_PCLK_DIVISORS,&vencDivisors,NULL);
+    retVal += DispApp_configDctrlPipe(appObj);
+    pixelClk = appObj->lcdPanelInfo.modeInfo.pixelClock *vencDivisors.divisorPCD;
+	retVal = mypclkcfg(pixelClk);
+    return (retVal);
+}
+
+
+static Int32 DispApp_configDctrlPipe(DispApp_Obj *appObj)
+{
+    Vps_DssDispcOvlyPipeConfig *ovlpipecfg;
+    UInt32           instCnt=0;
+    DispApp_InstObj *instObj;
+    Int32 retVal = FVID2_SOK;
+
+    instObj = &appObj->instObj[instCnt];
+    ovlpipecfg = &instObj->ovlpipeconfig;
+    ovlpipecfg->pipeLine    = instObj->instId;
+    ovlpipecfg->globalAlpha = 0xFF;
+    /* Z-order is in order GFX - 3, VID3 -2 ,VID2 - 1 and VID1 - 0 */
+    ovlpipecfg->zorder = instObj->instId;
+    ovlpipecfg->zorderEnable     = 1;
+    ovlpipecfg->preMultiplyAlpha = 0;
+    retVal += Fvid2_control(appObj->dctrlHandle,IOCTL_VPS_DCTRL_SET_PIPELINE_PARAMS,ovlpipecfg,NULL);
+    return retVal;
+}
+
+
+/**
+ *  DispApp_cbFxn
+ *  \brief Driver callback function.
+ */
+static Int32 DispApp_cbFxn(Fvid2_Handle handle, Ptr appData, Ptr reserved)
+{
+    Int32            retVal  = FVID2_SOK;
+    DispApp_InstObj *instObj = (DispApp_InstObj *) appData;
+    Fvid2_FrameList  frmList;
+    Vps_DssDispcRtParams *rtParam = NULL;
+
+    retVal = Fvid2_dequeue(instObj->drvHandle,&frmList,0U,FVID2_TIMEOUT_NONE);
+    if (FVID2_SOK == retVal)
+    {
+        rtParam = frmList.frames[0U]->perFrameCfg;
+        retVal = Fvid2_queue(instObj->drvHandle, &frmList, 0U);
+        if (FVID2_SOK != retVal)
+        {
+            GT_0trace(BspAppTrace, GT_ERR, APP_NAME ": Display Queue Failed!!!\r\n");
+        }
+    }
+    instObj->appObj->callBackCount++;
+    return (retVal);
+}
+
+
+static Int32 DispApp_LoadBuf(DispApp_Obj      *appObj,const DispApp_LoadBufCfg *cfg)
+{
+    Int32            retVal = FVID2_SOK;
+    char             userInput;
+    UInt32           bCnt;
+    DispApp_BufInfo *bufInfo = NULL;
+    char fileNameString[100];
+
+    switch (cfg->dataFmt)
+    {
+        case FVID2_DF_BGR24_888:
+            bufInfo = &BGR24888FieldsMerged;
+            memcpy(&bufInfo->bufCfg, cfg, sizeof (DispApp_LoadBufCfg));
+            if (NULL != bufInfo->bufAddr)
+            {
+                BspUtils_memFree(bufInfo->bufAddr, bufInfo->totalBufSize);
+                bufInfo->bufAddr      = NULL;
+                bufInfo->bufSize      = 0u;
+                bufInfo->totalBufSize = 0u;
+                for (bCnt = 0u; bCnt < DISP_APP_MAX_FRAMES_PER_HANDLE; bCnt++)
+                {
+                    bufInfo->bgrBufAddr[bCnt] = NULL;
+                }
+            }
+            if (bufInfo->bufCfg.pitch < bufInfo->bufCfg.width * 3u)
+            {
+                GT_1trace(BspAppTrace, GT_ERR,"Invalid pitch: %d\r\n", bufInfo->bufCfg.pitch);
+                GT_assert(BspAppTrace,bufInfo->bufCfg.pitch >= bufInfo->bufCfg.width * 3u);
+            }
+            else
+            {
+                bufInfo->bufSize =bufInfo->bufCfg.pitch * bufInfo->bufCfg.height;
+                bufInfo->totalBufSize =bufInfo->bufSize * bufInfo->bufCfg.numBuffers;
+                bufInfo->bufAddr = BspUtils_memAlloc(bufInfo->totalBufSize,VPS_BUFFER_ALIGNMENT);
+				BspUtils_memset(bufInfo->bufAddr, 0x7FU, (bufInfo->totalBufSize));
+                if (NULL == bufInfo->bufAddr)
+                {
+                    GT_0trace(BspAppTrace, GT_ERR,"Could not allocate buffer\n");
+                    bufInfo->bufSize      = 0u;
+                    bufInfo->totalBufSize = 0u;
+                    GT_assert(BspAppTrace, NULL != bufInfo->bufAddr);
+                }
+				UInt8 *p=bufInfo->bufAddr;
+				for(UInt32 i=0;i<bufInfo->totalBufSize/3;i++)
+					{
+					*p=0x00;p++;
+					*p=0x00;p++;
+					*p=0xFF;p++;
+				}
+            }
+            break;
+		case FVID2_DF_BGR16_565:
+				  bufInfo = &BGR16565FieldsMerged;
+				  memcpy(&bufInfo->bufCfg, cfg, sizeof (DispApp_LoadBufCfg));
+				  if (NULL != bufInfo->bufAddr)
+				  {
+					  BspUtils_memFree(bufInfo->bufAddr, bufInfo->totalBufSize);
+					  bufInfo->bufAddr		= NULL;
+					  bufInfo->bufSize		= 0u;
+					  bufInfo->totalBufSize = 0u;
+					  for (bCnt = 0u; bCnt < DISP_APP_MAX_FRAMES_PER_HANDLE; bCnt++)
+					  {
+						  bufInfo->bgrBufAddr[bCnt] = NULL;
+					  }
+				  }
+				  if (bufInfo->bufCfg.pitch < bufInfo->bufCfg.width * 2u)
+				  {
+					  GT_1trace(BspAppTrace, GT_ERR,"Invalid pitch: %d\r\n", bufInfo->bufCfg.pitch);
+					  GT_assert(BspAppTrace,bufInfo->bufCfg.pitch >= bufInfo->bufCfg.width * 2u);
+				  }
+				  else
+				  {
+					  bufInfo->bufSize =bufInfo->bufCfg.pitch * bufInfo->bufCfg.height;
+					  bufInfo->totalBufSize =bufInfo->bufSize * bufInfo->bufCfg.numBuffers;
+					  bufInfo->bufAddr = BspUtils_memAlloc(bufInfo->totalBufSize,VPS_BUFFER_ALIGNMENT);
+					  BspUtils_memset(bufInfo->bufAddr, 0x7FU, (bufInfo->totalBufSize));
+					  if (NULL == bufInfo->bufAddr)
+					  {
+						  GT_0trace(BspAppTrace, GT_ERR,"Could not allocate buffer\n");
+						  bufInfo->bufSize		= 0u;
+						  bufInfo->totalBufSize = 0u;
+						  GT_assert(BspAppTrace, NULL != bufInfo->bufAddr);
+					  }
+				  }
+				  break;
+
+        default:
+            GT_1trace(BspAppTrace, GT_ERR,
+                      "Invalid format: %d\r\n", cfg->dataFmt);
+            bufInfo = NULL;
+            retVal  = FVID2_EFAIL;
+            break;
+    }
+    if (FVID2_SOK == retVal)
+    {
+        /* Assign the buffer addresses */
+        for (bCnt = 0u; bCnt < DISP_APP_MAX_FRAMES_PER_HANDLE; bCnt++)
+        {
+            if (FVID2_SF_PROGRESSIVE == cfg->scanFmt)
+            {
+                bufInfo->yBufAddrEven[bCnt] =(void *) (bufInfo->bufAddr + (bCnt * bufInfo->bufSize));
+
+			if (FVID2_DF_BGR24_888 == cfg->dataFmt)
+                {
+                    bufInfo->bgrBufAddr[bCnt] =(void *) (bufInfo->bufAddr + (bCnt * bufInfo->bufSize));
+                }
+            }
+            else
+            {
+               //this is not valid.
+            }
+        }
+        GT_5trace(BspAppTrace, GT_INFO,
+                  "Load %d %s video frames of size %dx%d to location: 0x%p\r\n",
+                  bufInfo->bufCfg.numBuffers,
+                  Fvid2_getDataFmtString(bufInfo->bufCfg.dataFmt),
+                  bufInfo->bufCfg.width, bufInfo->bufCfg.height,
+                  bufInfo->bufAddr);
+		appPrint("The buffersize is: %d, and the total is:%d\n",bufInfo->bufSize,bufInfo->totalBufSize);
+        GT_0trace(BspAppTrace, GT_INFO,
+                "Couldnot Load buffer from SD card.\r\n"
+                "waiting for 1 min to load buffer from scripting console"
+                "Press any key (in UART console) after loading buffer\r\n");	
+        BspUtils_uartGetChar(&userInput, 60);
+        BspOsal_cacheWbInv(bufInfo->bufAddr, bufInfo->totalBufSize,BSP_OSAL_CT_ALL, BSP_OSAL_WAIT_FOREVER);
+    }
+    return retVal;
+}
+
+
+
+static Int32 DispApp_FreeBuf(DispApp_Obj              *appObj,
+                             const DispApp_LoadBufCfg *cfg)
+{
+    Int32            retVal = FVID2_SOK;
+    UInt32           bCnt;
+    DispApp_BufInfo *bufInfo = NULL;
+
+    switch (cfg->dataFmt)
+    {
+        case FVID2_DF_YUV422I_YUYV:
+            if ((FVID2_SF_INTERLACED == cfg->scanFmt) &&
+                (FALSE == cfg->fieldsMerged))
+            {
+                GT_0trace(BspAppTrace, GT_INFO,
+                          "Freeing YUYV422 Field Separated Buffer...\r\n");
+
+                bufInfo = &Yuyv422InterlacedFieldsSep;
+            }
+            else
+            {
+                GT_0trace(BspAppTrace, GT_INFO,
+                          "Freeing YUYV422 Field Merged Buffer...\r\n");
+
+                bufInfo = &Yuyv422FieldsMerged;
+            }
+            break;
+
+        case FVID2_DF_BGR24_888:
+            GT_0trace(BspAppTrace, GT_INFO,
+                      "Freeing BGR24 Field Merged Buffer...\r\n");
+            bufInfo = &BGR24888FieldsMerged;
+
+            break;
+
+        default:
+            GT_1trace(BspAppTrace, GT_ERR,
+                      "Invalid format: %d\r\n", cfg->dataFmt);
+            retVal  = FVID2_EFAIL;
+            bufInfo = NULL;
+            break;
+    }
+    if (FVID2_SOK == retVal)
+    {
+        if (NULL != bufInfo->bufAddr)
+        {
+            /* Free up the buffer */
+            BspUtils_memFree(bufInfo->bufAddr, bufInfo->totalBufSize);
+
+            bufInfo->bufAddr      = NULL;
+            bufInfo->bufSize      = 0u;
+            bufInfo->totalBufSize = 0u;
+            for (bCnt = 0u; bCnt < DISP_APP_MAX_FRAMES_PER_HANDLE; bCnt++)
+            {
+                switch (cfg->dataFmt)
+                {
+                    case FVID2_DF_YUV422I_YUYV:
+                        bufInfo->yBufAddrEven[bCnt] = NULL;
+                        break;
+                }
+            }
+        }
+    }
+    return (retVal);
+}
+
+/**
+ *  DispApp_GetBufInfo
+ */
+static DispApp_BufInfo *DispApp_GetBufInfo(const DispApp_Obj *appObj,
+                                           UInt32             dataFmt,
+                                           UInt32             scanFmt,
+                                           UInt32             fieldsMerged,
+                                           UInt32             pitch)
+{
+    DispApp_BufInfo *bufInfo = NULL;
+
+    switch (dataFmt)
+    {
+        case FVID2_DF_YUV422I_YUYV:
+            if ((FVID2_SF_INTERLACED == scanFmt) && (FALSE == fieldsMerged))
+            {
+                bufInfo = &Yuyv422InterlacedFieldsSep;
+            }
+            else
+            {
+                bufInfo = &Yuyv422FieldsMerged;
+            }
+            break;
+
+        case FVID2_DF_BGR24_888:
+
+            bufInfo = &BGR24888FieldsMerged;
+            break;
+
+        default:
+            GT_1trace(BspAppTrace, GT_ERR,
+                      "Invalid format: %d\r\n", dataFmt);
+            bufInfo = NULL;
+            break;
+    }
+    return (bufInfo);
+}
+
+/**
+ *  \brief Allocate and queue frames to driver
+ */
+static Int32 DispApp_allocAndQueueFrames(const DispApp_Obj *appObj,DispApp_InstObj   *instObj)
+{
+    Int32            retVal = FVID2_SOK;
+    UInt32           frmId;
+    UInt32           numFrames;
+    UInt32           yFld1Offset, cbCrFld0Offset, cbCrFld1Offset;
+    Fvid2_Format    *fmt;
+    Fvid2_Frame     *frm;
+    Fvid2_FrameList  frmList;
+    DispApp_BufInfo *bufInfo;
+
+    Fvid2FrameList_init(&frmList);
+
+    fmt = &instObj->allocFmt;
+    Fvid2Format_init(fmt);
+    frm = &instObj->frames[0U];
+
+    /* fill format with channel specific values  */
+    fmt->chNum          = 0U;
+    fmt->width          = appObj->maxWidth;
+    fmt->height         = appObj->maxHeight + DISP_APP_PADDING_LINES;
+    fmt->pitch[0]       = instObj->pitch[0];
+    fmt->pitch[1]       = instObj->pitch[1];
+    fmt->pitch[2]       = instObj->pitch[2];
+    fmt->fieldMerged[0] = instObj->isFieldMerge;
+    fmt->fieldMerged[1] = FALSE;
+    fmt->fieldMerged[2] = FALSE;
+    fmt->dataFormat     = instObj->inDataFmt;
+    fmt->scanFormat     = instObj->inScanFormat;
+    fmt->bpp = FVID2_BPP_BITS16;    /* ignored */
+
+    bufInfo = DispApp_GetBufInfo(appObj, instObj->inDataFmt,instObj->inScanFormat,instObj->isFieldMerge, instObj->pitch[0]);
+	
+    GT_assert(BspAppTrace, NULL != bufInfo);
+    numFrames = bufInfo->totalBufSize / bufInfo->bufSize;
+    /* init memory pointer for 'numFrames'  */
+    for (frmId = 0U; frmId < numFrames; frmId++)
+    {
+        /* init Fvid2_Frame to 0's  */
+        Fvid2Frame_init(&frm[frmId]);
+
+        /* copy chNum from Fvid2_Format */
+        frm[frmId].chNum      = fmt->chNum;
+        frm[frmId].addr[0][0] = bufInfo->bufAddr + (frmId * bufInfo->bufSize);
+        frm[frmId].fid        = FVID2_FID_FRAME;
+        frm[frmId].appData    = instObj;
+
+        /* Since BspUtils_memFrameAlloc is setting the address
+         * for only top field, set addresses for bottom fields. */
+        if (Fvid2_isDataFmtYuv422I(fmt->dataFormat) ||Fvid2_isDataFmtRgb(fmt->dataFormat))
+        {
+            if (fmt->fieldMerged[0] == TRUE)
+            {
+                yFld1Offset = (UInt32) frm[frmId].addr[0U][0U] +
+                              fmt->pitch[0U];
+                frm[frmId].addr[1U][0U] = (Ptr) yFld1Offset;
+            }
+            else
+            {
+                yFld1Offset = (UInt32) frm[frmId].addr[0U][0U] +
+                              ((fmt->pitch[0U] * appObj->maxHeight) / 2);
+                frm[frmId].addr[1U][0U] = (Ptr) yFld1Offset;
+            }
+        }
+        if (Fvid2_isDataFmtSemiPlanar(fmt->dataFormat))
+        {
+            if (fmt->fieldMerged[0] == TRUE)
+            {
+                yFld1Offset =
+                    (UInt32) frm[frmId].addr[0U][0U] + fmt->pitch[0U];
+                cbCrFld0Offset =
+                    (UInt32) ((UInt32) frm[frmId].addr[0U][0U] +
+                              (fmt->pitch[0U] * appObj->maxHeight * 2U));
+                cbCrFld1Offset =
+                    (UInt32) (cbCrFld0Offset + fmt->pitch[0U]);
+            }
+            else
+            {
+                yFld1Offset =
+                    (UInt32) ((UInt32) frm[frmId].addr[0U][0U] +
+                              (fmt->pitch[0U] * appObj->maxHeight * 3U) / 2);
+
+                cbCrFld0Offset =
+                    (UInt32) ((UInt32) frm[frmId].addr[0U][0U] +
+                              (fmt->pitch[0U] * appObj->maxHeight));
+
+                cbCrFld1Offset =
+                    (UInt32) (yFld1Offset +
+                              (fmt->pitch[0U] * appObj->maxHeight));
+            }
+            frm[frmId].addr[0U][1U] = (Ptr) cbCrFld0Offset;
+            frm[frmId].addr[1U][0U] = (Ptr) yFld1Offset;
+            frm[frmId].addr[1U][1U] = (Ptr) cbCrFld1Offset;
+        }
+		
+        /* Set number of frame in frame list - one at a time */
+        frmList.numFrames  = 1U;
+        frmList.frames[0U] = &frm[frmId];
+
+        /*
+         * queue the frames in frmList
+         * All allocate frames are queued here as an example.
+         * In general atleast 2 frames per channel need to queued
+         * before starting display,
+         * else frame will get dropped until frames are queued
+         */
+        retVal = Fvid2_queue(instObj->drvHandle, &frmList, 0U);
+        if (FVID2_SOK != retVal)
+        {
+            GT_0trace(BspAppTrace, GT_ERR,
+                      APP_NAME ": Display Queue Failed!!!\r\n");
+            break;
+        }
+    }
+
+    return (retVal);
+}
+
+/**
+ *  DispApp_initParams
+ *  Initialize the global variables and frame pointers.
+ */
+static void DispApp_initParams(DispApp_Obj *appObj)
+{
+    UInt32 instCnt;
+    Vps_DispDssParams *dssPrms;
+    DispApp_InstObj   *instObj;
+
+    appObj->maxWidth  = DISP_APP_BUF_WIDTH;
+    appObj->maxHeight = DISP_APP_BUF_HEIGHT;
+
+    appObj->totalFldCount = 0U;
+    appObj->totalCpuLoad  = 0U;
+    appObj->cpuLoadCount  = 0U;
+    appObj->callBackCount = 0U;
+    appObj->lcdCtrlhdl    = NULL;
+
+    for (instCnt = 0U; instCnt < appObj->testPrms.numHandles; instCnt++)//only one handle.
+    {
+        instObj = &appObj->instObj[instCnt];
+        instObj->inDataFmt = appObj->testPrms.inDataFmt[instCnt];
+
+        if (Fvid2_isDataFmtSemiPlanar(instObj->inDataFmt))
+        {
+            instObj->pitch[FVID2_YUV_SP_Y_ADDR_IDX] =
+                VpsUtils_align(appObj->maxWidth, VPS_BUFFER_ALIGNMENT);
+            instObj->pitch[FVID2_YUV_SP_CBCR_ADDR_IDX] =
+                instObj->pitch[FVID2_YUV_SP_Y_ADDR_IDX];
+        }
+        else if (Fvid2_isDataFmtYuv422I(instObj->inDataFmt))
+        {
+            instObj->pitch[FVID2_YUV_INT_ADDR_IDX] =
+                VpsUtils_align(appObj->maxWidth * 2U, VPS_BUFFER_ALIGNMENT);
+        }
+        else if (Fvid2_isDataFmtRgb16bit(instObj->inDataFmt))
+        {
+            instObj->pitch[FVID2_YUV_INT_ADDR_IDX] =
+                VpsUtils_align(appObj->maxWidth * 2U, VPS_BUFFER_ALIGNMENT);
+        }
+        else if (Fvid2_isDataFmtRgb24bit(instObj->inDataFmt))
+        {
+            /* Align the pitch to BPP boundary as well since the pitch
+             * aligined to VPS_BUFFER_ALIGNMENT may not be multiple of 3
+             * bytes (1 pixel) */
+            instObj->pitch[FVID2_RGB_ADDR_IDX] =
+                VpsUtils_align(appObj->maxWidth * 3U,
+                               (VPS_BUFFER_ALIGNMENT * 3U));
+        }
+        else if (Fvid2_isDataFmtRgb32bit(instObj->inDataFmt))
+        {
+            /* Align the pitch to BPP boundary as well since the pitch
+             * aligined to VPS_BUFFER_ALIGNMENT may not be multiple of 3
+             * bytes (1 pixel) */
+            instObj->pitch[FVID2_RGB_ADDR_IDX] =
+                VpsUtils_align(appObj->maxWidth * 4U,
+                               (VPS_BUFFER_ALIGNMENT));
+        }
+
+        instObj->inWidth      = appObj->testPrms.inWidth[instCnt];
+        instObj->inHeight     = appObj->testPrms.inHeight[instCnt];
+        instObj->isFieldMerge = appObj->testPrms.isFieldMerge[instCnt];
+        instObj->inScanFormat = appObj->testPrms.inScanFormat[instCnt];
+        instObj->posx         = appObj->testPrms.posx[instCnt];
+        instObj->posy         = appObj->testPrms.posy[instCnt];
+        instObj->instId       = appObj->testPrms.instId[instCnt];
+        instObj->drvHandle    = NULL;
+        Fvid2CbParams_init(&instObj->cbPrms);
+        instObj->cbPrms.cbFxn   = &DispApp_cbFxn;
+        instObj->cbPrms.appData = instObj;
+        instObj->appObj         = appObj;
+
+        VpsDispCreateParams_init(&instObj->createPrms);
+
+        dssPrms = &instObj->dssPrms;
+        VpsDispDssParams_init(&instObj->dssPrms);
+        dssPrms->inFmt.chNum           = 0U;
+        dssPrms->inFmt.width           = instObj->inWidth;
+        dssPrms->inFmt.height          = instObj->inHeight;
+        dssPrms->inFmt.pitch[0U]       = instObj->pitch[0U];
+        dssPrms->inFmt.pitch[1U]       = instObj->pitch[1U];
+        dssPrms->inFmt.pitch[2U]       = instObj->pitch[2U];
+        dssPrms->inFmt.fieldMerged[0U] = instObj->isFieldMerge;
+        dssPrms->inFmt.fieldMerged[1U] = FALSE;
+        dssPrms->inFmt.fieldMerged[2U] = FALSE;
+        dssPrms->inFmt.dataFormat      = instObj->inDataFmt;
+        dssPrms->inFmt.scanFormat      = instObj->inScanFormat;
+        dssPrms->inFmt.bpp      = FVID2_BPP_BITS16;
+        dssPrms->inFmt.reserved = NULL;
+        dssPrms->tarWidth       = dssPrms->inFmt.width;
+        dssPrms->tarHeight      = dssPrms->inFmt.height;
+        dssPrms->posX           = instObj->posx;
+        dssPrms->posY           = instObj->posy;
+
+        VpsDssDispcVidConfig_init(&instObj->vidCfg);
+        VpsDssDispcGfxConfig_init(&instObj->gfxCfg);
+
+        if (Vps_dispIsVidInst(instObj->instId))
+        {
+            dssPrms->vidCfg = &instObj->vidCfg;
+        }
+        if (Vps_dispIsGfxInst(instObj->instId))
+        {
+            dssPrms->gfxCfg = &instObj->gfxCfg;
+        }
+    }
+
+    return;
+}
+
+static void DispApp_printStatistics(DispApp_Obj *appObj,
+                                    UInt32       execTimeInMsecs)
+{
+    UInt32           instCnt;
+    DispApp_InstObj *instObj;
+
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+    GT_0trace(BspAppTrace, GT_INFO, " Execution Statistics \r\n");
+    GT_0trace(BspAppTrace, GT_INFO, " ==================== \r\n");
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+    GT_2trace(BspAppTrace, GT_INFO,
+              " Execution time    : %d.%d s \r\n",
+              (execTimeInMsecs / 1000), (execTimeInMsecs % 1000));
+    GT_2trace(BspAppTrace, GT_INFO,
+              " Total field Count : %d (%d fields/sec) \r\n",
+              appObj->totalFldCount,
+              (appObj->totalFldCount * 1000) / execTimeInMsecs);
+    GT_1trace(BspAppTrace, GT_INFO,
+              " Avg CPU Load      : %d %% \r\n",
+              appObj->totalCpuLoad / appObj->cpuLoadCount);
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+
+    for (instCnt = 0U; instCnt < appObj->testPrms.numHandles; instCnt++)
+    {
+        instObj = &appObj->instObj[instCnt];
+
+        /* Print the driver status */
+        BspUtils_appPrintDispStatus(
+            instObj->drvHandle,
+            instObj->instId,
+            execTimeInMsecs);
+    }
+
+    /* Print the Display Controller error status */
+    BspUtils_appPrintDctrlStatus(
+        appObj->dctrlHandle);
+
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+
+    return;
+}
+
+static void DispApp_turnoffLCD(DispApp_Obj *appObj)
+{
+	appPrint("This is turnning off the LCD app!/n");
+    return;
+}
+
+
+
+Int32 myappDefaultInit(UInt32 isI2cInitReq)
+{
+    Int32                   retVal = BSP_SOK;
+    Vps_InitParams          vpsInitPrms;
+    Bsp_CommonInitParams    commonInitPrms;						//this param has one uint32 member for commom libinit,
+    Bsp_BoardInitParams     boardInitPrms;
+    Bsp_PlatformInitParams  platInitPrms;
+    Bsp_DeviceInitParams    deviceInitPrms;
+    const Bsp_BoardI2cData *i2cData;
+
+    BspCommonInitParams_init(&commonInitPrms);					//commonInitPrms.reserved=0
+    retVal += Bsp_commonInit(&commonInitPrms);					//nothing	
+    if (BSP_SOK != retVal)										
+    {														
+        GT_0trace(BspAppTrace, GT_ERR, "Error: BSP Common Init failed!!\r\n");
+    }
+
+    BspBoardInitParams_init(&boardInitPrms);					
+	/*  initPrms->boardId      = BSP_BOARD_MAX;
+        initPrms->baseBoardRev = BSP_BOARD_REV_MAX;
+        initPrms->dcBoardRev   = BSP_BOARD_REV_MAX;
+        initPrms->customData   = NULL;*/
+    /* Override board detection if I2C is disabled */
+
+
+	
+    retVal += Bsp_boardInit(&boardInitPrms);					//a global struct gboardCommomObj is used, set this global as all 0u;
+	/*gBoardCommonObj.boardId      = initPrms->boardId;
+    gBoardCommonObj.baseBoardRev = initPrms->baseBoardRev;
+    gBoardCommonObj.dcBoardRev   = initPrms->dcBoardRev;
+    gBoardCommonObj.customData   = initPrms->customData;
+	*/
+	
+	if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: Board Init failed!!\r\n");
+    }
+
+    BspPlatformInitParams_init(&platInitPrms);//此处用于platinitPrms->isAllMcASPInitReq   = (UInt32) FALSE;音频模块关闭
+	/*initPrms->isPinMuxSettingReq  = (UInt32) TRUE;
+	initPrms->isIrqXBarSettingReq = (UInt32) TRUE;
+	initPrms->isDmaXBarSettingReq = (UInt32) TRUE;
+	initPrms->isAllMcSPIInitReq   = (UInt32) FALSE;
+	initPrms->isAllMcASPInitReq   = (UInt32) FALSE;
+	*/
+	
+    retVal += Bsp_platformInit(&platInitPrms);//gplatformcommonobj.platform=evm,gpaltform.socId=_AM5728(0x200u)
+    /*
+    gPlatformCommonObj.platformId = BSP_PLATFORM_ID_UNKNOWN;
+    gPlatformCommonObj.socId      = BSP_PLATFORM_SOC_ID_UNKNOWN;
+    gPlatformCommonObj.coreId     = BSP_PLATFORM_CORE_ID_UNKNOWN;
+	gPlatformCommonObj.platformId = BSP_PLATFORM_ID_EVM;
+	#ifdef __ARM_ARCH_7A__
+		gPlatformCommonObj.coreId = BSP_PLATFORM_CORE_ID_A15;
+	#endif
+	#ifdef __TI_ARM_V7M4__
+		gPlatformCommonObj.coreId = BSP_PLATFORM_CORE_ID_M4;
+	#endif
+	#ifdef _TMS320C6X
+		gPlatformCommonObj.coreId = BSP_PLATFORM_CORE_ID_DSP;
+	#endif
+	#ifdef BUILD_A8
+		gPlatformCommonObj.coreId = BSP_PLATFORM_CORE_ID_A8;
+	#endif
+	#ifdef BUILD_M3
+		gPlatformCommonObj.coreId = BSP_PLATFORM_CORE_ID_M3;
+	#endif
+	    gPlatformCommonObj.socId = BSP_PLATFORM_SOC_ID_AM572X;
+	    gPlatformCommonObj.cpuRev      = Bsp_platformTda2xxGetCpuRev();
+    	gPlatformCommonObj.packageType = Bsp_platformTda2xxGetPackageType();
+    	
+	*/
+
+	//here is the step to be done !!!
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: Platform Init failed!!\r\n");
+    }
+
+    retVal += Fvid2_init(NULL);
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: FVID2 Init failed!!\r\n");
+    }
+
+    VpsInitParams_init(&vpsInitPrms);
+
+    /* Pass the interrupt numbers from application for VPS instances.
+     * setting same interrupt numbers as in default setting for referance.
+     * Specifying for all instances, only applicable instances are used by lib.
+     * Driver will only register for the specified interrupt numbers.
+     * The corresponding crossbar mapping for the device interrupt should be
+     * done by the application. In the Vps examples the crossar mapping is
+     * done from function Bsp_platformTda2xxInit/Bsp_platformTda3xxInit.
+     * Application may pass the Bsp_PlatformInitParams->isIrqXBarSettingReq as
+     * false to Bsp_platformInit function and do all the crossbar mapping
+     * required or update the crossbar configuration done in
+     * Bsp_platformTda2xxInit/Bsp_platformTda3xxInit.
+     */
+    #if defined (VPS_VIP1_BUILD)
+        vpsInitPrms.irqParams.vipIrqNum[0U] = CSL_INTC_EVENTID_VIP1INT0;
+    #endif
+    #if defined (VPS_VIP2_BUILD)
+        vpsInitPrms.irqParams.vipIrqNum[1U] = CSL_INTC_EVENTID_VIP2INT0;
+    #endif
+    #if defined (VPS_VIP3_BUILD)
+        vpsInitPrms.irqParams.vipIrqNum[2U] = CSL_INTC_EVENTID_VIP3INT0;
+    #endif
+    #if defined (VPS_VPE_BUILD)
+        vpsInitPrms.irqParams.vpeIrqNum    = CSL_INTC_EVENTID_VPEINT0;
+    #endif
+    #if defined (VPS_DSS_BUILD)
+        vpsInitPrms.irqParams.dssIrqNum    = CSL_INTC_EVENTID_DSS_DISPC;
+    #endif
+    #if defined (VPS_CAL_BUILD)
+        vpsInitPrms.irqParams.calIrqNum    = CSL_CAL_IRQ_NUM;
+    #endif
+    #if defined (VPS_ISS_BUILD)
+        vpsInitPrms.irqParams.issIrqNum    = CSL_ISS_IRQ0_NUM;
+    #endif
+    retVal += Vps_init(&vpsInitPrms);
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: VPS Init failed!!\r\n");
+    }
+
+    /* Override I2C init for non-EVM builds */
+    if (BSP_PLATFORM_ID_EVM != Bsp_platformGetId())
+    {
+        isI2cInitReq = FALSE;
+		appPrint("the platformId now is not EVM\n");
+    }
+//above will not be excuted.
+    if (((Bool) TRUE) == ((Bool) isI2cInitReq))
+    {
+        i2cData = Bsp_boardGetI2cData();
+        GT_assert(BspAppTrace, (NULL != i2cData));
+        GT_assert(BspAppTrace,
+                  (i2cData->numInst <= BSP_DEVICE_I2C_INST_ID_MAX));
+        GT_assert(BspAppTrace, (NULL != i2cData->instData));
+
+        BspDeviceInitParams_init(&deviceInitPrms);
+#if defined (SOC_TDA3XX)
+        deviceInitPrms.isI2cProbingReq = TRUE;
+#else
+        /* For J6 Eco 23X23 and 17X17 Evms the I2C3 SDA line is connected to
+         * daughter card connector EXP_P1 pin 12. This is used for JMAR App
+         * board. But on Vision App board the corresponding pin is connected to
+         * GPIO_USER_RESET connected to CPLD. The probe causes the CPLD to reset.
+         * So disabling probe for TDA2Ex build
+         */
+        deviceInitPrms.isI2cProbingReq = FALSE;
+#endif
+        retVal += Bsp_deviceInit(&deviceInitPrms);
+        if (BSP_SOK != retVal)
+        {
+            GT_0trace(BspAppTrace, GT_ERR, "Error: Device Init failed!!\r\n");
+        }
+    }
+
+    retVal += Bsp_boardLateInit();
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: Board Late Init failed!!\r\n");
+    }
+
+    retVal += BspUtils_memInit();
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: App MEM Utils Init failed!!\r\n");
+    }
+
+    retVal += BspUtils_prfInit();
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: App PRF Utils Init failed!!\r\n");
+    }
+
+    retVal += BspUtils_appInit();
+    if (BSP_SOK != retVal)
+    {
+        GT_0trace(BspAppTrace, GT_ERR, "Error: App Utils Init failed!!\r\n");
+    }
+
+
+    /* All trace prints after this will go to UART console insted of CCS. */
+
+    /* Print FVID2 and BSP version string and platform info*/
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+    GT_2trace(BspAppTrace, GT_INFO,
+              " Build time            : [%s %s]\r\n", __TIME__, __DATE__);
+    GT_1trace(BspAppTrace, GT_INFO,
+              " FVID2 Version         : [%s]\r\n", Fvid2_getVersionString());
+    GT_1trace(BspAppTrace, GT_INFO,
+              " BSP Version           : [%s]\r\n", Bsp_getVersionString());
+    Bsp_platformPrintInfo();
+    Bsp_boardPrintInfo();
+    GT_0trace(BspAppTrace, GT_INFO, " \r\n");
+
+    return (retVal);
+}
+
+void mylcdon(void)
+   {
+       UInt32 muxVal;
+       //GPMC A15 Mux Mode to gpio3_24------CTRL_CORE_PAD_VIN1A_D20
+       muxVal = HW_RD_REG32(0x4A003544);
+       muxVal &= (UInt32)0xFFFFFFF0U;
+       muxVal |= (0xE & 0x0000000FU);
+       HW_WR_REG32(0x4A003544, muxVal);
+
+       //Enable GPIO required for LCD power on for GP EVM
+       muxVal = HW_RD_REG32(0x48057130);
+       muxVal &= (UInt32)0xFFFFFFFEU;
+       HW_WR_REG32(0x48057130, muxVal);
+
+       //GPIODirModeSet
+       muxVal = HW_RD_REG32(0x48057134);
+       muxVal &= ~(UInt32)(1<<24);
+       HW_WR_REG32(0x48057134, muxVal);
+       //GPIOPinWrite
+       muxVal = HW_RD_REG32(0x4805713C);
+       muxVal |= (UInt32)(1<<24);
+       HW_WR_REG32(0x4805713C, muxVal);
+
+       Uint32 lcdmuxVal = 0x4A0035C8;
+
+   for(int i=0; i<29; i++)//this should be 21、29
+   {
+       lcdmuxVal=lcdmuxVal+i*4;
+       lcdmuxVal &= ~(UInt32)0x0FU;
+       lcdmuxVal |= (0x0U & 0x0000000FU);
+       HW_WR_REG32(0x4A0035C8, muxVal);
+   }
+
+       //VIN1D3 Mux Mode to gpio3_7------CTRL_CORE_PAD_VIN1A_D3
+       muxVal = HW_RD_REG32(0x4A003500);
+       muxVal &= (UInt32)(0xFFFFFFF0U);
+       muxVal |= (0xE & 0x0000000FU);
+       HW_WR_REG32(0x4A003500, muxVal);
+
+       //Enable GPIO
+       muxVal = HW_RD_REG32(0x48057130);
+       muxVal &= (UInt32)0xFFFFFFFEU;
+       HW_WR_REG32(0x48057130, muxVal);
+
+       //GPIODirModeSet
+       muxVal = HW_RD_REG32(0x48057134);
+       muxVal &= ~(UInt32)(1<<7);
+       HW_WR_REG32(0x48057134, muxVal);
+       //GPIOPinWrite
+       muxVal = HW_RD_REG32(0x4805713C);
+       muxVal |= (UInt32)(1<<7);
+       HW_WR_REG32(0x4805713C, muxVal);
+   }
+
+int mypclkcfg(UInt32 pixclk)
+{
+UInt32 timeDelay = 0xFFFFFFFFU;
+pmhalPrcmNodeId_t videopllId=PMHAL_PRCM_VIDEOPLL_VIDEO1;
+UInt32 maxorMinMN=PMLIB_VIDEO_PLL_CALC_MAX_MN;
+PMLIBVideopllSetFreq(videopllId,(UInt32)pixclk,(UInt32)maxorMinMN,timeDelay);
+//M4 enable
+HW_WR_FIELD32_RAW((UInt32)0x58004310U,(UInt32)0x10000U,(UInt32)16U,(UInt32)1U);
+//PMHALVideopllConfigureMux,this configures the dpll_dsi1_a_clk1 fron DPLL_video 1
+HW_WR_FIELD32_RAW((UInt32)0x4a002538U,(UInt32)0x18U,(UInt32)3U,(UInt32)0U);
+//this makes the source of LCD1_CLK from dpll_dsi1_a_clk1, this can be read from 0x5800005C
+HW_WR_FIELD32_RAW((UInt32)0x58000040U,(UInt32)0x1U,(UInt32)0U,(UInt32)1U);
+//set the LCD and PCD
+HW_WR_FIELD32_RAW((UInt32)0x58001070U,(UInt32)0x000000FFU,(UInt32)0U,(UInt32)1U);
+HW_WR_FIELD32_RAW((UInt32)0x58001070U,(UInt32)0x00FF0000U,(UInt32)16U,(UInt32)1U);
+return 0;
+} 
+
+void setpolarity(void)
+{
+    UInt32 regval;
+    regval = HW_RD_REG32(0x5800106CU);
+    regval |= (UInt32)0x1U<<17;
+    HW_WR_REG32(0x5800106CU, regval);
+
+    regval = HW_RD_REG32(0x4A002534U);
+    regval |= (UInt32)0x1U<<22;
+    HW_WR_REG32(0x4A002534U, regval);
+
+    regval = HW_RD_REG32(0x5800106CU);
+    regval |= (UInt32)0x1U<<16;
+    HW_WR_REG32(0x5800106CU, regval);
+
+    regval = HW_RD_REG32(0x4A002534U);
+    regval |= (UInt32)0x1U<<16;
+    HW_WR_REG32(0x4A002534U, regval);
+
+    //DE-15 set to 0,means high active
+    regval = HW_RD_REG32(0x5800106CU);
+    regval &= ~((UInt32)0x1U<<15);
+    HW_WR_REG32(0x5800106CU, regval);
+
+    //the data is driven by the rising fall of pixel clk, this is set to 0.
+    regval = HW_RD_REG32(0x5800106CU);
+    regval &= ~((UInt32)0x1U<<14);
+    HW_WR_REG32(0x5800106CU, regval);  
+    regval = HW_RD_REG32(0x4A002534U);
+    regval &= ~((UInt32)0x1U<<19);
+    HW_WR_REG32(0x4A002534U, regval);
+    
+    //the HV-sync is set to high active, this is set to 0;
+    regval = HW_RD_REG32(0x5800106CU);
+    regval |= (UInt32)0x1U<<13;
+    HW_WR_REG32(0x5800106CU, regval);
+    regval = HW_RD_REG32(0x5800106CU);
+    regval |= (UInt32)0x1U<<12;
+    HW_WR_REG32(0x5800106CU, regval);
+}
+
+
+
+void changecolor(void)
+{
+	DispApp_BufInfo *bufInfo = &BGR24888FieldsMerged;
+	UInt8 *p=0x80400000;
+	UInt32 cut=bufInfo->totalBufSize/3;
+	UInt32 i;
+	static num=0;
+	
+	if(num==0)
+	{
+	BspUtils_memset(bufInfo->bufAddr, 0xFFU, (bufInfo->totalBufSize)/4);	
+	num=1;
+	appPrint("num=0,the color is clear\n ");
+	}
+	else
+	{
+	BspUtils_memcpy(bufInfo->bufAddr, bufInfo->bufAddr+(bufInfo->totalBufSize)/2, (bufInfo->totalBufSize)/4);
+	num=0;
+	appPrint("num=1,the clear board!!!\n ");
+	}	
+}
